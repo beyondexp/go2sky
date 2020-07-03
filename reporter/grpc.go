@@ -30,12 +30,15 @@ import (
 	managementv3 "github.com/SkyAPM/go2sky/reporter/grpc/management"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/connectivity"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/metadata"
 )
 
 const (
 	maxSendQueueSize     int32 = 30000
 	defaultCheckInterval       = 20 * time.Second
 	defaultLogPrefix           = "go2sky-gRPC"
+	authKey                    = "Authentication"
 )
 
 // NewGRPCReporter create a new reporter to send data to gRPC oap server. Only one backend address is allowed.
@@ -48,7 +51,16 @@ func NewGRPCReporter(serverAddr string, opts ...GRPCReporterOption) (go2sky.Repo
 	for _, o := range opts {
 		o(r)
 	}
-	conn, err := grpc.Dial(serverAddr, grpc.WithInsecure()) //TODO add TLS
+
+	var credsDialOption grpc.DialOption
+	if r.creds != nil {
+		// use tls
+		credsDialOption = grpc.WithTransportCredentials(r.creds)
+	} else {
+		credsDialOption = grpc.WithInsecure()
+	}
+
+	conn, err := grpc.Dial(serverAddr, credsDialOption)
 	if err != nil {
 		return nil, err
 	}
@@ -76,10 +88,31 @@ func WithCheckInterval(interval time.Duration) GRPCReporterOption {
 	}
 }
 
+// WithMaxSendQueueSize setup send span queue buffer length
+func WithMaxSendQueueSize(maxSendQueueSize int) GRPCReporterOption {
+	return func(r *gRPCReporter) {
+		r.sendCh = make(chan *agentv3.SegmentObject, maxSendQueueSize)
+	}
+}
+
 // WithInstanceProps setup service instance properties eg: org=SkyAPM
 func WithInstanceProps(props map[string]string) GRPCReporterOption {
 	return func(r *gRPCReporter) {
 		r.instanceProps = props
+	}
+}
+
+// WithTransportCredentials setup transport layer security
+func WithTransportCredentials(creds credentials.TransportCredentials) GRPCReporterOption {
+	return func(r *gRPCReporter) {
+		r.creds = creds
+	}
+}
+
+// WithAuthentication used Authentication for gRPC
+func WithAuthentication(auth string) GRPCReporterOption {
+	return func(r *gRPCReporter) {
+		r.md = metadata.New(map[string]string{authKey: auth})
 	}
 }
 
@@ -93,6 +126,9 @@ type gRPCReporter struct {
 	traceClient      agentv3.TraceSegmentReportServiceClient
 	managementClient managementv3.ManagementServiceClient
 	checkInterval    time.Duration
+
+	md    metadata.MD
+	creds credentials.TransportCredentials
 }
 
 func (r *gRPCReporter) Boot(service string, serviceInstance string) {
@@ -194,7 +230,7 @@ func (r *gRPCReporter) initSendPipeline() {
 	go func() {
 	StreamLoop:
 		for {
-			stream, err := r.traceClient.Collect(context.Background())
+			stream, err := r.traceClient.Collect(metadata.NewOutgoingContext(context.Background(), r.md))
 			if err != nil {
 				r.logger.Printf("open stream error %v", err)
 				time.Sleep(5 * time.Second)
@@ -232,7 +268,7 @@ func (r *gRPCReporter) reportInstanceProperties() (err error) {
 			})
 		}
 	}
-	_, err = r.managementClient.ReportInstanceProperties(context.Background(), &managementv3.InstanceProperties{
+	_, err = r.managementClient.ReportInstanceProperties(metadata.NewOutgoingContext(context.Background(), r.md), &managementv3.InstanceProperties{
 		Service:         r.service,
 		ServiceInstance: r.serviceInstance,
 		Properties:      props,
@@ -261,7 +297,7 @@ func (r *gRPCReporter) check() {
 				instancePropertiesSubmitted = true
 			}
 
-			_, err := r.managementClient.KeepAlive(context.Background(), &managementv3.InstancePingPkg{
+			_, err := r.managementClient.KeepAlive(metadata.NewOutgoingContext(context.Background(), r.md), &managementv3.InstancePingPkg{
 				Service:         r.service,
 				ServiceInstance: r.serviceInstance,
 			})
